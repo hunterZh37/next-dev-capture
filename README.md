@@ -1,13 +1,20 @@
 # next-dev-capture
 
-Local bug capture for any Next.js App Router project. Nothing is committed.
+Local bug capture for any Next.js App Router or Vite project (Vue, React, Svelte, plain). Nothing is committed.
 
 ## Install
 
     git clone https://github.com/hunterZh37/next-dev-capture.git ~/next-dev-capture
     ~/next-dev-capture/install.sh path/to/your-next-app
 
-Then restart `npm run dev`. Needs Next.js 15.3+ (App Router) and zsh (macOS default).
+The installer detects the framework from `package.json`. Needs zsh (macOS default).
+
+- **Next.js** (15.3+, App Router): restart `npm run dev`.
+- **Vite** (5+): start the dev server with the capture config, plus your usual flags:
+
+      npx vite --config vite.config.dev-capture.mjs
+
+  Plain `npm run dev` stays exactly as before, so capture is on only when you ask for it.
 
 ## Use
 
@@ -19,10 +26,20 @@ Then restart `npm run dev`. Needs Next.js 15.3+ (App Router) and zsh (macOS defa
 
 ## How it stays local
 
+**Next.js**
 - **Client:** `instrumentation-client.ts`, which Next.js runs in the browser before the app loads.
 - **Server:** `app/api/dev-capture/route.ts`, which writes the files.
-- **Git:** both are listed in `.git/info/exclude`, so git never sees them.
 - **Off by default:** it only runs with `NODE_ENV=development` and `NEXT_PUBLIC_DEV_CAPTURE=1` in `.env.local`.
+
+**Vite**
+- **Config:** `vite.config.dev-capture.mjs` loads your own `vite.config.*` and adds one plugin. Your config is not edited.
+- **Plugin:** `dev-capture.vite.mjs` runs on the dev server only (`apply: "serve"`), so builds never include it.
+- **Client:** `dev-capture.client.ts` (the same file as the Next.js client), added to the page by the plugin.
+- **Server:** the plugin answers `POST /__dev-capture`, its own path, so an `/api` proxy or real `/api` functions are never in the way. It only accepts writes from the dev server's own pages, so other sites and other host names are refused.
+- **Iframes:** each same-origin iframe page gets its own copy; the hotkey captures the frame that has focus.
+
+**Both**
+- **Git:** every added file is listed in `.git/info/exclude`, so git never sees them.
 
 ## Remove
 

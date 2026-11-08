@@ -1,7 +1,7 @@
 /**
- * next-dev-capture (client). Installed locally by ~/Desktop/next-dev-capture/install.sh as
- * instrumentation-client.ts, git-excluded, never committed.
- * Off unless NODE_ENV=development and NEXT_PUBLIC_DEV_CAPTURE=1.
+ * next-dev-capture (client). Installed locally by ~/next-dev-capture/install.sh, git-excluded, never committed.
+ * - Next.js: as instrumentation-client.ts. Off unless NODE_ENV=development and NEXT_PUBLIC_DEV_CAPTURE=1.
+ * - Vite: as dev-capture.client.ts, loaded only by the dev-capture plugin (dev server only, never in a build).
  * - Keeps the last 300 console lines (with times).
  * - Ctrl+Shift+L (Cmd+Shift+L on Mac) saves a page screenshot + those lines to .dev-captures/<time>/ via /api/dev-capture.
  * - Cmd/Ctrl+Shift+K toggles recording: a frame every 2 s plus the console lines since the
@@ -10,8 +10,11 @@
  *   uncaught errors), at most once per 30 s.
  */
 
+// A constant at build time, so a production build drops all of this. Next.js inlines these env values; under Vite
+// the dev-capture plugin replaces the same three expressions in this file (dev server only).
 const ENABLED =
   process.env.NODE_ENV === "development" && process.env.NEXT_PUBLIC_DEV_CAPTURE === "1";
+const ENDPOINT = process.env.DEV_CAPTURE_ENDPOINT || "/api/dev-capture";
 
 const AUTO_TRIGGERS = [
   /connect still waiting on/i,
@@ -74,7 +77,7 @@ function installDevCapture() {
   // Network: every fetch / XHR with method, URL (secrets hidden), status, time, and whether it is
   // still pending. No bodies or headers are kept.
   const net: Net[] = [];
-  const skipNet = (url: string) => /\/api\/dev-capture|webpack-hmr|\/_next\/static|__nextjs|hot-update/.test(url);
+  const skipNet = (url: string) => /\/api\/dev-capture|\/__dev-capture|webpack-hmr|\/_next\/static|__nextjs|hot-update|\/@vite\/|\/@id\/|\/@fs\/|\.vite\/deps|__vite/.test(url);
   const track = (method: string, url: string): Net | null => {
     if (skipNet(url)) return null;
     const e: Net = { t: new Date().toISOString(), method: method.toUpperCase(), url: cleanUrl(url), state: "pending", status: null, ms: null, changed: Date.now() };
@@ -140,7 +143,7 @@ function installDevCapture() {
       if (!lib) {
         // Loaded at capture time in local dev only, so the app gains no dependency.
         const libUrl = "https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/+esm";
-        lib = (await import(/* webpackIgnore: true */ libUrl)) as typeof lib;
+        lib = (await import(/* webpackIgnore: true */ /* @vite-ignore */ libUrl)) as typeof lib;
       }
       return await lib!.toPng(document.body, {
         pixelRatio: 1,
@@ -202,9 +205,9 @@ function installDevCapture() {
     busy = true;
     try {
       const png = grabTab() ?? (await shoot());
-      const res = await fetch("/api/dev-capture", {
+      const res = await fetch(ENDPOINT, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Dev-Capture": "1" },
         body: JSON.stringify({
           reason,
           url: location.href,
@@ -237,9 +240,9 @@ function installDevCapture() {
       r.netSince = Date.now();
       const png = grabTab() ?? (await shoot());
       r.frame += 1;
-      await fetch("/api/dev-capture", {
+      await fetch(ENDPOINT, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Dev-Capture": "1" },
         body: JSON.stringify({
           recording: r.id,
           frame: r.frame,
@@ -313,7 +316,8 @@ function installDevCapture() {
       }
     };
   }
-  const onErr = (e: ErrorEvent) => console.error(`Uncaught ${e.message}`);
+  // Chrome already starts the message with "Uncaught"; add it only where the browser does not.
+  const onErr = (e: ErrorEvent) => console.error(/^Uncaught/.test(e.message) ? e.message : `Uncaught ${e.message}`);
   const onRej = (e: PromiseRejectionEvent) => console.error(`Unhandled rejection ${fmt(e.reason)}`);
   const onKey = (e: KeyboardEvent) => {
     // Ctrl+Shift+L, or Cmd+Shift+L on a Mac.
