@@ -23,6 +23,7 @@ The installer detects the framework from `package.json`. Needs zsh (macOS defaul
 - **Network:** every capture includes `network.txt`: each request's time, status, duration and method, plus anything still **PENDING** with how long it has waited. Recordings also write `frame-0001.net.txt` per frame. Bodies and headers are never kept, and secret-looking URL values are hidden.
 - **Automatic:** captures when a console line matches `AUTO_TRIGGERS` in `instrumentation-client.ts` (by default: React update-in-render warnings, uncaught errors, unhandled rejections, and two example app patterns you can replace).
 - **Output:** `<project>/.dev-captures/`.
+- **Iframes:** pages in same-origin iframes (phones on a demo stage, a dashboard) hand the keys to the top page. One capture or recording then holds the whole tab, with every frame's console and network lines marked `[frame title]`. Name a frame with `title` or `data-capture-label`.
 
 ## How it stays local
 
@@ -36,7 +37,6 @@ The installer detects the framework from `package.json`. Needs zsh (macOS defaul
 - **Plugin:** `dev-capture.vite.mjs` runs on the dev server only (`apply: "serve"`), so builds never include it.
 - **Client:** `dev-capture.client.ts` (the same file as the Next.js client), added to the page by the plugin.
 - **Server:** the plugin answers `POST /__dev-capture`, its own path, so an `/api` proxy or real `/api` functions are never in the way. It only accepts writes from the dev server's own pages, so other sites and other host names are refused.
-- **Iframes:** each same-origin iframe page gets its own copy; the hotkey captures the frame that has focus.
 
 **Both**
 - **Git:** every added file is listed in `.git/info/exclude`, so git never sees them.

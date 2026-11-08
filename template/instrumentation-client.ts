@@ -8,6 +8,8 @@
  *   last frame, into .dev-captures/rec-<time>/ (stops by itself after 10 minutes).
  * - Also captures on its own when a watched line appears (stuck connect, React update-in-render,
  *   uncaught errors), at most once per 30 s.
+ * - Pages in same-origin iframes (phones on a demo stage) hand their keys and auto captures to the top page, which
+ *   captures the whole tab with every frame's console and network, each line marked with its frame.
  */
 
 // A constant at build time, so a production build drops all of this. Next.js inlines these env values; under Vite
@@ -27,9 +29,10 @@ const REC_EVERY_MS = 2000;
 const REC_MAX_MS = 10 * 60_000;
 const AUTO_GAP_MS = 30_000;
 
-type Line = { n: number; t: string; level: string; text: string };
+type Line = { n: number; ms: number; t: string; level: string; text: string };
 type Net = {
   t: string;
+  at: number;
   method: string;
   url: string;
   state: "pending" | "done" | "failed";
@@ -39,6 +42,54 @@ type Net = {
   changed: number;
 };
 const MAX_NET = 300;
+
+type SentNet = Omit<Net, "changed"> & { pendingMs?: number };
+/** What each page's capture shares with the top page (same origin only). */
+type FrameState = {
+  label: string;
+  lines: () => Line[];
+  netSince: (since: number) => SentNet[];
+  shoot?: () => Promise<string | null>;
+  /** a kept copy's original lines, so a recording does not send them twice */
+  from?: Line[];
+};
+/** The top page's capture, which frames hand their keys and auto captures to. */
+type Hub = {
+  key: (k: "k" | "l") => void;
+  auto: (reason: string) => void;
+  /** a frame about to unload hands over what it logged, so a crash right before a reload is not lost */
+  keep: (st: FrameState) => void;
+};
+/** Per page, the last line number already sent in a recording. */
+type Cursor = WeakMap<Line[], number>;
+type CaptureWindow = Window & { __devCaptureOn?: boolean; __devCaptureState?: FrameState; __devCaptureHub?: Hub };
+
+/** This page's name in a merged capture: the iframe's data-capture-label, title or name, else its address. */
+function frameLabel(): string {
+  try {
+    const fe = window.frameElement as HTMLElement | null;
+    if (fe) return fe.dataset.captureLabel || fe.title || fe.getAttribute("name") || `${location.pathname}${location.search}${location.hash}`;
+  } catch {
+    /* cross-origin parent */
+  }
+  return "page";
+}
+
+/** Every same-origin page in this tab that runs capture: this one, then its frames, depth first. */
+function allFrames(): FrameState[] {
+  const out: FrameState[] = [];
+  const walk = (win: Window, depth: number) => {
+    try {
+      const st = (win as CaptureWindow).__devCaptureState;
+      if (st) out.push(st);
+    } catch {
+      /* another origin: its console stays its own */
+    }
+    if (depth < 4) for (let i = 0; i < win.frames.length; i++) walk(win.frames[i]!, depth + 1);
+  };
+  walk(window, 0);
+  return out;
+}
 
 /** Same-origin URLs as path + query; secret-looking query values hidden; long URLs cut. */
 function cleanUrl(raw: string): string {
@@ -67,7 +118,7 @@ function fmt(arg: unknown): string {
 
 function installDevCapture() {
   if (!ENABLED || typeof window === "undefined") return;
-  const w = window as unknown as { __devCaptureOn?: boolean };
+  const w = window as CaptureWindow;
   if (w.__devCaptureOn) return;
   w.__devCaptureOn = true;
 
@@ -80,7 +131,7 @@ function installDevCapture() {
   const skipNet = (url: string) => /\/api\/dev-capture|\/__dev-capture|webpack-hmr|\/_next\/static|__nextjs|hot-update|\/@vite\/|\/@id\/|\/@fs\/|\.vite\/deps|__vite/.test(url);
   const track = (method: string, url: string): Net | null => {
     if (skipNet(url)) return null;
-    const e: Net = { t: new Date().toISOString(), method: method.toUpperCase(), url: cleanUrl(url), state: "pending", status: null, ms: null, changed: Date.now() };
+    const e: Net = { t: new Date().toISOString(), at: Date.now(), method: method.toUpperCase(), url: cleanUrl(url), state: "pending", status: null, ms: null, changed: Date.now() };
     net.push(e);
     if (net.length > MAX_NET) {
       // Drop the oldest finished entries first; keep anything still pending.
@@ -127,18 +178,58 @@ function installDevCapture() {
     return XS.call(this, body);
   };
   /** Requests changed since `since` (ms) plus everything still pending, oldest first. */
-  const netSince = (since: number) =>
+  const netSince = (since: number): SentNet[] =>
     net
       .filter((x) => x.state === "pending" || x.changed >= since)
       .map(({ changed: _c, ...rest }) => ({
         ...rest,
         ...(rest.state === "pending" ? { pendingMs: Math.round(Date.now() - Date.parse(rest.t)) } : {}),
       }));
+  w.__devCaptureState = { label: frameLabel(), lines: () => lines, netSince, shoot: () => shoot() };
+  // pages that unloaded while this tab was open (top page only): their last lines, kept for the next capture
+  const gone: FrameState[] = [];
+
+  // In a frame whose top page runs capture too: that page captures for the whole tab
+  const hub = (): Hub | null => {
+    try {
+      return window.top && window.top !== window ? ((window.top as CaptureWindow).__devCaptureHub ?? null) : null;
+    } catch {
+      return null;
+    }
+  };
+  /** Every page whose lines belong in a capture: the live ones, then those that unloaded. */
+  const sources = (): FrameState[] => [...allFrames(), ...gone];
+  // marked by page whenever this page has frames, so one capture never mixes marked and unmarked lines
+  const many = () => window.frames.length > 0 || gone.length > 0;
+  const mark = (f: FrameState, text: string) => (many() ? `[${f.label}] ${text}` : text);
+  /**
+   * Console lines of every page in the tab, oldest first. With a cursor: only lines not sent yet, and the cursor
+   * moves past them (by each page's own line number, so two lines in the same millisecond are never lost).
+   */
+  const tabLines = (cursor?: Cursor): Line[] =>
+    sources()
+      .flatMap((f) => {
+        const all = f.lines();
+        const after = cursor?.get(all) ?? 0;
+        const fresh = all.filter((l) => l.n > after);
+        if (cursor && all.length) cursor.set(all, all[all.length - 1]!.n);
+        return fresh.map((l) => ({ ...l, text: mark(f, l.text) }));
+      })
+      .sort((a, b) => a.ms - b.ms);
+  /** Requests of every page, oldest first; past the cap, finished ones go first so a stuck request stays. */
+  const tabNet = (since: number): SentNet[] => {
+    const all = sources()
+      .flatMap((f) => f.netSince(since).map((n) => ({ ...n, url: mark(f, n.url) })))
+      .sort((a, b) => a.at - b.at);
+    let extra = all.length - MAX_NET;
+    return extra <= 0 ? all : all.filter((n) => n.state === "pending" || extra-- <= 0);
+  };
   let busy = false;
   let lastAuto = 0;
+  let lastManual = 0;
 
   let lib: { toPng: (n: HTMLElement, o?: object) => Promise<string> } | null = null;
-  const shoot = async (): Promise<string | null> => {
+  const shoot = async (skipFrames = false): Promise<string | null> => {
     try {
       if (!lib) {
         // Loaded at capture time in local dev only, so the app gains no dependency.
@@ -148,12 +239,56 @@ function installDevCapture() {
       return await lib!.toPng(document.body, {
         pixelRatio: 1,
         skipFonts: true,
-        filter: (n: Node) => !(n instanceof HTMLElement && n.dataset.devCaptureToast === "1"),
+        filter: (n: Node) =>
+          !(n instanceof HTMLElement && n.dataset.devCaptureToast === "1") && !(skipFrames && n instanceof HTMLIFrameElement),
       });
     } catch (e) {
-      lines.push({ n: ++seq, t: new Date().toISOString(), level: "capture", text: `screenshot failed: ${fmt(e)}` });
+      lines.push({ n: ++seq, ms: Date.now(), t: new Date().toISOString(), level: "capture", text: `screenshot failed: ${fmt(e)}` });
       return null;
     }
+  };
+
+  /**
+   * The page with each same-origin frame drawn by that frame's own capture, at its place on the page. Redrawing the
+   * whole page at once draws frames wrongly (sized and placed as the outer page, overlapping).
+   */
+  const shootTab = async (): Promise<string | null> => {
+    const iframes = [...document.querySelectorAll("iframe")];
+    if (!iframes.length) return shoot();
+    const load = (src: string) =>
+      new Promise<HTMLImageElement | null>((ok) => {
+        const img = new Image();
+        img.onload = () => ok(img);
+        img.onerror = () => ok(null);
+        img.src = src;
+      });
+    const base = await shoot(true);
+    const page = base ? await load(base) : null;
+    if (!page) return base;
+    const c = document.createElement("canvas");
+    c.width = page.width;
+    c.height = page.height;
+    const g = c.getContext("2d");
+    if (!g) return base;
+    g.drawImage(page, 0, 0);
+    const origin = document.body.getBoundingClientRect();
+    for (const fe of iframes) {
+      let st: FrameState | undefined;
+      try {
+        st = (fe.contentWindow as CaptureWindow | null)?.__devCaptureState;
+      } catch {
+        continue; // another origin: left as the blank box the page drew
+      }
+      const shot = st?.shoot ? await st.shoot() : null;
+      const img = shot ? await load(shot) : null;
+      if (!img) continue;
+      const r = fe.getBoundingClientRect();
+      const x = r.left - origin.left + fe.clientLeft;
+      const y = r.top - origin.top + fe.clientTop;
+      // the frame's visible box at 1:1, cropped like the frame itself crops its page
+      g.drawImage(img, 0, 0, fe.clientWidth, fe.clientHeight, x, y, fe.clientWidth, fe.clientHeight);
+    }
+    return c.toDataURL("image/png");
   };
 
   // Real pixels of this tab (scroll position, images exactly as seen). Asked once per
@@ -204,7 +339,7 @@ function installDevCapture() {
     if (busy) return;
     busy = true;
     try {
-      const png = grabTab() ?? (await shoot());
+      const png = grabTab() ?? (await shootTab());
       const res = await fetch(ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Dev-Capture": "1" },
@@ -212,8 +347,8 @@ function installDevCapture() {
           reason,
           url: location.href,
           viewport: `${innerWidth}x${innerHeight}`,
-          lines,
-          network: netSince(0),
+          lines: tabLines().slice(-MAX_LINES),
+          network: tabNet(0),
           png,
         }),
       });
@@ -225,20 +360,26 @@ function installDevCapture() {
   };
 
   // Recording: a frame every 2 s with the console lines since the previous frame.
-  let rec: { id: string; timer: number; started: number; sent: number; netSince: number; frame: number } | null = null;
+  type Rec = { id: string; timer: number; started: number; cursor: Cursor; first: boolean; netSince: number; frame: number };
+  let rec: Rec | null = null;
+  let starting = false;
   let recBusy = false;
   let badge: HTMLDivElement | null = null;
-  const recFrame = async () => {
-    if (!rec || recBusy) return;
-    if (Date.now() - rec.started > REC_MAX_MS) return void stopRec("10 minute limit");
+  /** One frame of a recording. The last one (on stop) waits for a frame still saving, so the final lines arrive. */
+  const recFrame = async (r: Rec | null = rec, last = false) => {
+    if (!r) return;
+    if (last) for (let i = 0; recBusy && i < 200; i++) await new Promise((ok) => setTimeout(ok, 50));
+    else if (recBusy) return;
+    if (!last && Date.now() - r.started > REC_MAX_MS) return void stopRec("10 minute limit");
     recBusy = true;
-    const r = rec;
     try {
-      const fresh = lines.filter((l) => l.n > r.sent);
-      r.sent = seq;
-      const netFresh = netSince(r.netSince);
-      r.netSince = Date.now();
-      const png = grabTab() ?? (await shoot());
+      const now = Date.now();
+      // the first frame carries the last 50 lines from before the recording, as on a single page before
+      const fresh = tabLines(r.cursor).slice(r.first ? -50 : -MAX_LINES);
+      r.first = false;
+      const netFresh = tabNet(r.netSince);
+      r.netSince = now;
+      const png = grabTab() ?? (await shootTab());
       r.frame += 1;
       await fetch(ENDPOINT, {
         method: "POST",
@@ -260,9 +401,17 @@ function installDevCapture() {
     }
   };
   const startRec = async () => {
-    const shared = await startTabStream();
+    // a second press while the share picker is open must not start a second recording
+    if (starting || rec) return;
+    starting = true;
+    let shared = false;
+    try {
+      shared = await startTabStream();
+    } finally {
+      starting = false;
+    }
     const id = `rec-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    rec = { id, timer: 0, started: Date.now(), sent: Math.max(0, seq - 50), netSince: Date.now() - 30_000, frame: 0 };
+    rec = { id, timer: 0, started: Date.now(), cursor: new WeakMap(), first: true, netSince: Date.now() - 30_000, frame: 0 };
     rec.timer = window.setInterval(() => void recFrame(), REC_EVERY_MS);
     void recFrame();
     badge = document.createElement("div");
@@ -279,10 +428,11 @@ function installDevCapture() {
   };
   const stopRec = (why = "stopped") => {
     if (!rec) return;
-    window.clearInterval(rec.timer);
-    const frames = rec.frame;
-    void recFrame();
+    const r = rec;
+    window.clearInterval(r.timer);
     rec = null;
+    void recFrame(r, true);
+    const frames = r.frame + 1;
     window.setTimeout(stopTabStream, 1500);
     badge?.remove();
     badge = null;
@@ -306,32 +456,78 @@ function installDevCapture() {
     console[level] = (...args: unknown[]) => {
       orig[level]!(...args);
       const text = args.map(fmt).join(" ");
-      lines.push({ n: ++seq, t: new Date().toISOString(), level, text });
+      lines.push({ n: ++seq, ms: Date.now(), t: new Date().toISOString(), level, text });
       if (lines.length > MAX_LINES) lines.splice(0, lines.length - MAX_LINES);
       const hit = AUTO_TRIGGERS.find((re) => re.test(text));
       if (hit && Date.now() - lastAuto > AUTO_GAP_MS) {
         lastAuto = Date.now();
         // Let the UI settle a moment so the screenshot shows the state the line is about.
-        setTimeout(() => void capture(`auto: ${text.slice(0, 80)}`), 600);
+        const reason = `auto: ${hub() ? `[${w.__devCaptureState?.label}] ` : ""}${text.slice(0, 80)}`;
+        setTimeout(() => {
+          const h = hub();
+          if (h) h.auto(reason);
+          else void capture(reason);
+        }, 600);
       }
     };
   }
   // Chrome already starts the message with "Uncaught"; add it only where the browser does not.
   const onErr = (e: ErrorEvent) => console.error(/^Uncaught/.test(e.message) ? e.message : `Uncaught ${e.message}`);
   const onRej = (e: PromiseRejectionEvent) => console.error(`Unhandled rejection ${fmt(e.reason)}`);
-  const onKey = (e: KeyboardEvent) => {
-    // Ctrl+Shift+L, or Cmd+Shift+L on a Mac.
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "K" || e.key === "k")) {
-      e.preventDefault();
+  const handleKey = (k: "k" | "l") => {
+    if (k === "k") {
+      if (starting) return;
       if (rec) stopRec();
       else void startRec();
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "L" || e.key === "l")) {
-      e.preventDefault();
+    } else {
+      // presses within a second are one capture (a quick save would otherwise take one per press)
+      if (Date.now() - lastManual < 1000) return;
+      lastManual = Date.now();
       void capture("manual (Ctrl+Shift+L)");
     }
   };
+  const onKey = (e: KeyboardEvent) => {
+    // Cmd/Ctrl+Shift+K records, Cmd/Ctrl+Shift+L captures once
+    if (!((e.ctrlKey || e.metaKey) && e.shiftKey)) return;
+    const k = e.key.toLowerCase();
+    if (k !== "k" && k !== "l") return;
+    e.preventDefault();
+    if (e.repeat) return; // a held key is one press
+    // a page in a frame hands the key to the top page, which captures the whole tab
+    const h = hub();
+    if (h) h.key(k);
+    else handleKey(k);
+  };
+  if (window.top === window) {
+    w.__devCaptureHub = {
+      key: handleKey,
+      // one auto capture for the whole tab at a time, whichever frame saw the line
+      auto: (reason) => {
+        // only a capture that actually starts holds the next one off
+        if (busy || Date.now() - lastAuto < AUTO_GAP_MS) return;
+        lastAuto = Date.now();
+        void capture(reason);
+      },
+      keep: (st) => {
+        if (rec && st.from) rec.cursor.set(st.lines(), rec.cursor.get(st.from) ?? 0);
+        gone.push(st);
+        if (gone.length > 6) gone.shift();
+      },
+    };
+  }
+  // a frame that unloads (reload, navigation) leaves its last lines with the top page
+  addEventListener("pagehide", () => {
+    const h = hub();
+    if (!h) return;
+    const kept = lines.slice(-100);
+    const keptNet = netSince(0);
+    h.keep({
+      label: `${w.__devCaptureState?.label ?? "frame"} (before reload)`,
+      lines: () => kept,
+      from: lines,
+      netSince: (since) => keptNet.filter((n) => n.state === "pending" || Date.parse(n.t) >= since),
+    });
+  });
   addEventListener("error", onErr);
   addEventListener("unhandledrejection", onRej);
   addEventListener("keydown", onKey);
