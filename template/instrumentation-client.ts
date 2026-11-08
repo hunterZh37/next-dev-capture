@@ -59,6 +59,16 @@ type Hub = {
   auto: (reason: string) => void;
   /** a frame about to unload hands over what it logged, so a crash right before a reload is not lost */
   keep: (st: FrameState) => void;
+  /**
+   * For a test runner driving the browser (Puppeteer and the like): a recording whose frames it sends itself, each
+   * with its own screenshot (real pixels from the browser) and a step name, paired with the console and network
+   * lines since the previous frame.
+   */
+  run?: {
+    start: (name?: string) => string;
+    frame: (png: string | null, step?: string) => Promise<{ frame: string } | null>;
+    stop: () => Promise<{ frames: number; dir: string | null }>;
+  };
 };
 /** Per page, the last line number already sent in a recording. */
 type Cursor = WeakMap<Line[], number>;
@@ -360,17 +370,21 @@ function installDevCapture() {
   };
 
   // Recording: a frame every 2 s with the console lines since the previous frame.
-  type Rec = { id: string; timer: number; started: number; cursor: Cursor; first: boolean; netSince: number; frame: number };
+  type Rec = { id: string; timer: number; started: number; cursor: Cursor; first: boolean; netSince: number; frame: number; external?: boolean; dir?: string };
   let rec: Rec | null = null;
   let starting = false;
   let recBusy = false;
   let badge: HTMLDivElement | null = null;
   /** One frame of a recording. The last one (on stop) waits for a frame still saving, so the final lines arrive. */
-  const recFrame = async (r: Rec | null = rec, last = false) => {
-    if (!r) return;
-    if (last) for (let i = 0; recBusy && i < 200; i++) await new Promise((ok) => setTimeout(ok, 50));
-    else if (recBusy) return;
-    if (!last && Date.now() - r.started > REC_MAX_MS) return void stopRec("10 minute limit");
+  const recFrame = async (r: Rec | null = rec, last = false, given?: { png: string | null }): Promise<string | null> => {
+    if (!r) return null;
+    // the last frame, and every frame a runner sends, waits its turn instead of being skipped
+    if (last || given) for (let i = 0; recBusy && i < 400; i++) await new Promise((ok) => setTimeout(ok, 50));
+    else if (recBusy) return null;
+    if (!last && !r.external && Date.now() - r.started > REC_MAX_MS) {
+      stopRec("10 minute limit");
+      return null;
+    }
     recBusy = true;
     try {
       const now = Date.now();
@@ -379,14 +393,14 @@ function installDevCapture() {
       r.first = false;
       const netFresh = tabNet(r.netSince);
       r.netSince = now;
-      const png = grabTab() ?? (await shootTab());
-      r.frame += 1;
-      await fetch(ENDPOINT, {
+      const png = given ? given.png : grabTab() ?? (await shootTab());
+      const n = r.frame + 1;
+      const res = await fetch(ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Dev-Capture": "1" },
         body: JSON.stringify({
           recording: r.id,
-          frame: r.frame,
+          frame: n,
           url: location.href,
           viewport: `${innerWidth}x${innerHeight}`,
           lines: fresh,
@@ -394,8 +408,12 @@ function installDevCapture() {
           png,
         }),
       });
+      if (!res.ok) return null;
+      r.frame = n; // a frame counts once the server has it
+      r.dir ??= ((await res.json().catch(() => ({}))) as { dir?: string }).dir;
+      return String(n).padStart(4, "0");
     } catch {
-      /* keep recording */
+      return null; // keep recording
     } finally {
       recBusy = false;
     }
@@ -477,6 +495,7 @@ function installDevCapture() {
   const handleKey = (k: "k" | "l") => {
     if (k === "k") {
       if (starting) return;
+      if (rec?.external) return void toast("A test run is recording");
       if (rec) stopRec();
       else void startRec();
     } else {
@@ -508,6 +527,30 @@ function installDevCapture() {
         lastAuto = Date.now();
         void capture(reason);
       },
+      run: {
+        start: (name) => {
+          if (rec) stopRec("replaced by a test run");
+          const slug = String(name ?? "run").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "run";
+          const id = `rec-${new Date().toISOString().replace(/[:.]/g, "-")}-${slug}`;
+          rec = { id, timer: 0, started: Date.now(), cursor: new WeakMap(), first: true, netSince: Date.now() - 30_000, frame: 0, external: true };
+          return id;
+        },
+        frame: async (png, step) => {
+          const r = rec;
+          if (!r?.external) return null;
+          // the step name goes in this frame's console lines, so each picture reads with what was being done
+          if (step) lines.push({ n: ++seq, ms: Date.now(), t: new Date().toISOString(), level: "step", text: step });
+          const frame = await recFrame(r, false, { png });
+          return frame ? { frame } : null;
+        },
+        stop: async () => {
+          const r = rec;
+          if (!r?.external) return { frames: 0, dir: null };
+          for (let i = 0; recBusy && i < 400; i++) await new Promise((ok) => setTimeout(ok, 50));
+          rec = null;
+          return { frames: r.frame, dir: r.dir ?? null };
+        },
+      },
       keep: (st) => {
         if (rec && st.from) rec.cursor.set(st.lines(), rec.cursor.get(st.from) ?? 0);
         gone.push(st);
@@ -520,12 +563,17 @@ function installDevCapture() {
     const h = hub();
     if (!h) return;
     const kept = lines.slice(-100);
-    const keptNet = netSince(0);
+    // a request still open when the page leaves never finishes: say so, rather than showing it pending forever
+    const left = Date.now();
+    const keptNet = netSince(0).map((n) =>
+      n.state === "pending" ? { ...n, state: "failed" as const, error: "page left before it finished", pendingMs: undefined, leftAt: left } : { ...n, leftAt: 0 }
+    );
     h.keep({
       label: `${w.__devCaptureState?.label ?? "frame"} (before reload)`,
       lines: () => kept,
       from: lines,
-      netSince: (since) => keptNet.filter((n) => n.state === "pending" || Date.parse(n.t) >= since),
+      // a request cut off by the page leaving shows in the next frame (stamped when the page left), then not again
+      netSince: (since) => keptNet.filter((n) => (n.leftAt ? n.leftAt >= since : Date.parse(n.t) >= since)).map(({ leftAt: _l, ...n }) => n),
     });
   });
   addEventListener("error", onErr);

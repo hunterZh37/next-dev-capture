@@ -1,0 +1,9 @@
+{
+  "name": "next-dev-capture-runner",
+  "private": true,
+  "type": "module",
+  "description": "Drives an app in Chrome from a scenario file and records it frame by frame with next-dev-capture",
+  "dependencies": {
+    "puppeteer-core": "23.10.4"
+  }
+}

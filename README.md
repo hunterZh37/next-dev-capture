@@ -25,6 +25,35 @@ The installer detects the framework from `package.json`. Needs zsh (macOS defaul
 - **Output:** `<project>/.dev-captures/`.
 - **Iframes:** pages in same-origin iframes (phones on a demo stage, a dashboard) hand the keys to the top page. One capture or recording then holds the whole tab, with every frame's console and network lines marked `[frame title]`. Name a frame with `title` or `data-capture-label`.
 
+## Scenario runner
+
+Drives the app in Chrome from a script and records it frame by frame. Each frame is a real screenshot of the browser,
+named after the step being run, with the console and network lines of every page in the tab since the frame before.
+
+    npm install --prefix ~/next-dev-capture/runner          # once: puppeteer-core, uses your installed Chrome
+    node ~/next-dev-capture/runner/run.mjs --url http://localhost:5173/ --scenario my.scenario.mjs --rounds 3
+
+- **Options:** `--rounds N`, `--every MS` (extra frames while a step runs, default 1000), `--width`/`--height`, `--headful`.
+- **Output:** `.dev-captures/rec-<time>-<name>-r<round>/`: `frame-0001.png` + `.txt` (console) + `.net.txt` (network), and `summary.md` (every step, its time, and where it failed).
+- **Exit code:** 0 when every round passed, 1 otherwise.
+
+A scenario is a module whose default export gets `t`:
+
+```js
+export const name = 'checkout'
+export default async function (t) {
+  await t.step('Phone A: join', async () => {
+    const f = await t.frame('Phone A')          // an iframe by its title (or t.page.mainFrame())
+    await t.type(f, '#name', 'Ava')               // CSS selectors start with # . [ or css=
+    await t.click(f, 'Join')                      // anything else is visible text; waits until enabled
+    await t.waitText(f, "You're in")
+  })
+}
+export async function teardown(t) {}             // optional, after the last round (also: setup, between)
+```
+
+Also: `t.waitUrl(f, /re/)`, `t.find(f, target)`, `t.stripeCard(f)` (Stripe test card into a nested Stripe iframe), `t.snap(name)`, `t.wait(ms)`, `t.page` (Puppeteer).
+
 ## How it stays local
 
 **Next.js**
