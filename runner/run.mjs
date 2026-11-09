@@ -69,7 +69,13 @@ const browser = await puppeteer.launch({
   executablePath: CHROME,
   headless: HEADFUL ? false : "shell",
   defaultViewport: { width: WIDTH, height: HEIGHT },
-  args: [`--window-size=${WIDTH},${HEIGHT + 90}`],
+  // a visible window behind others gets its timers slowed to a crawl by Chrome: waits then time out at random
+  args: [
+    `--window-size=${WIDTH},${HEIGHT + 90}`,
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+  ],
 });
 const page = await browser.newPage();
 const pageErrors = [];
@@ -134,15 +140,20 @@ async function find(frame, target, { timeout = 10_000, enabled = true } = {}) {
 
 let snapping = Promise.resolve();
 let inFlight = 0;
+let lastEnd = 0; // when the last frame finished saving
 let lost = 0; // frames the page did not take: its recording is gone (the top page reloaded) or a save failed
 /** One frame: a real screenshot of the whole browser window plus the lines since the last frame. Serialized. */
 function snap(step, { tick = false } = {}) {
   // a timed frame while one is still saving is skipped, so slow saves never pile up behind a step
-  if (tick && inFlight) return snapping;
+  // ...and the page gets a breather of EVERY ms after each one: back-to-back screenshots keep a visible window
+  // redrawing nonstop (it flashes) and starve the page, so its own waits time out
+  if (tick && (inFlight || Date.now() - lastEnd < EVERY)) return snapping;
   inFlight++;
   snapping = snapping.then(async () => {
     try {
-      const png = await page.screenshot({ encoding: "base64" });
+      // captureBeyondViewport: false keeps Puppeteer from resizing the page for each shot, which made a visible
+      // (--headful) window flash every frame
+      const png = await page.screenshot({ encoding: "base64", captureBeyondViewport: false });
       const r = await page.evaluate(
         (png, step) => window.__devCaptureHub?.run?.frame(`data:image/png;base64,${png}`, step) ?? null,
         png,
@@ -153,6 +164,7 @@ function snap(step, { tick = false } = {}) {
       lost++;
     } finally {
       inFlight--;
+      lastEnd = Date.now();
     }
   });
   return snapping;
@@ -207,14 +219,24 @@ function makeT(round) {
       }
     },
     /** Types into an input by selector (cleared first). */
+    /** Types into an input by selector (cleared first), and checks what landed: a page re-rendering mid-typing can
+     *  drop keys or reset the field, so it retypes up to 3 times. */
     async type(frame, selector, text, opts) {
-      const el = await find(frame, selector, { enabled: false, ...opts });
-      await el.click({ clickCount: 3 }).catch(() => {});
-      await el.evaluate((e) => {
-        e.value = "";
-        e.dispatchEvent(new Event("input", { bubbles: true }));
-      });
-      await el.type(String(text), { delay: 15 });
+      const want = String(text);
+      let got = "";
+      for (let tries = 1; tries <= 3; tries++) {
+        const el = await find(frame, selector, { enabled: false, ...opts });
+        await el.click({ clickCount: 3 }).catch(() => {});
+        await el.evaluate((e) => {
+          e.value = "";
+          e.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+        await el.type(want, { delay: 25 });
+        await wait(250);
+        got = await el.evaluate((e) => e.value).catch(() => "");
+        if (got === want) return;
+      }
+      throw new Error(`${selector} reads "${got}" after typing "${want}" 3 times`);
     },
     /** Waits until the frame's visible text contains `text` (a string or RegExp). */
     async waitText(frame, text, { timeout = 15_000 } = {}) {
@@ -246,9 +268,17 @@ function makeT(round) {
             if (!/stripe\.com/.test(f.url())) continue;
             const el = await f.$(names.map((n) => `input[name="${n}"]`).join(",")).catch(() => null);
             if (el) {
-              await el.click().catch(() => {});
-              await el.type(value, { delay: 20 });
-              return true;
+              // Stripe reformats as you type, and a fast typist can lose keys: check what landed, retype if short
+              const digits = (v) => String(v).replace(/\D/g, "");
+              for (let tries = 1; tries <= 3; tries++) {
+                await el.click({ clickCount: 3 }).catch(() => {});
+                await el.press("Backspace").catch(() => {});
+                await el.type(value, { delay: 60 });
+                await wait(150);
+                const got = await el.evaluate((e) => e.value).catch(() => "");
+                if (digits(got) === digits(value) || (!digits(value) && got)) return true;
+              }
+              throw new Error(`Stripe field ${names[0]} would not take ${value.length} characters`);
             }
           }
           if (Date.now() > until) return false;
